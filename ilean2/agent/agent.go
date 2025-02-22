@@ -71,41 +71,62 @@ func NewAgent(conf *config.Config) (*Agent, error) {
 }
 
 func (a *Agent) Connector() {
+	// Начальная задержка для backoff
+	backoff := time.Second
+	maxBackoff := time.Minute
+
 	for {
-		<-a.err
-		a.read = false
+		select {
+		case <-a.err:
+			a.mutex.Lock()
+			a.read = false
+			a.mutex.Unlock()
 
-		// Отменяем текущий контекст и создаем новый
-		if a.cancel != nil {
-			a.cancel()
-		}
-		a.ctx, a.cancel = context.WithCancel(context.Background())
+			// Отменяем текущий контекст и создаем новый
+			if a.cancel != nil {
+				a.cancel()
+			}
+			a.ctx, a.cancel = context.WithCancel(context.Background())
 
-		a.Close()
+			a.Close()
+			logrus.Info("lost connection")
 
-		logrus.Info("lost connection")
+			// Цикл переподключения
+			for {
+				logrus.Info("attempting to reconnect")
 
-		for {
-			logrus.Info("attempting to reconnect")
+				if err := a.connectToSocket(); err != nil {
+					logrus.WithError(err).Error("failed to reconnect to socket")
+					time.Sleep(backoff)
+					// Экспоненциальный backoff
+					backoff = time.Duration(float64(backoff) * 1.5)
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+					continue
+				}
 
-			if err := a.connectToSocket(); err != nil {
-				logrus.WithError(err).Error("failed to reconnect to socket")
-				time.Sleep(time.Second * 4) // Задержка между попытками
-				continue
+				if err := a.connectToDevice(); err != nil {
+					logrus.WithError(err).Error("failed to reconnect to device")
+					time.Sleep(backoff)
+					continue
+				}
+
+				// Сброс задержки после успешного подключения
+				backoff = time.Second
+				break
 			}
 
-			if err := a.connectToDevice(); err != nil {
-				logrus.WithError(err).Error("failed to reconnect to device")
-				time.Sleep(time.Second * 4) // Задержка между попытками
-				continue
-			}
+			logrus.Info("reconnection successful")
 
-			break // Успешное подключение
+			a.mutex.Lock()
+			a.read = true
+			a.mutex.Unlock()
+
+			// Запуск обработки в контексте
+			go a.ProcessingStream()
+
 		}
-
-		logrus.Info("reconnection successful")
-		a.read = true
-		go a.ProcessingStream()
 	}
 }
 
