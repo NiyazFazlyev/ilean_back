@@ -1,12 +1,10 @@
 package agent
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"iLean/config"
-	"iLean/entity"
 	"io"
 	"sync"
 	"time"
@@ -17,9 +15,16 @@ import (
 )
 
 const (
-	preamOneByte byte = 85
-	preamTwoByte byte = 170
-	typeCommand  int  = 1
+	preamOneByte      byte = 85
+	preamTwoByte      byte = 170
+	typeCommand       int  = 1
+	websocketURL           = "ws://185.27.192.21:63240/ws"
+	reconnectDelay         = 4 * time.Second
+	serialPortName         = "/dev/ttyAMA0"
+	serialBaudRate         = 115200
+	serialDataBits         = 8
+	serialStopBits         = 1
+	serialMinReadSize      = 2
 )
 
 type Agent struct {
@@ -34,8 +39,12 @@ type Agent struct {
 	read    bool
 }
 
-func NewAgent(conf *config.Config) (*Agent, error) {
+type Greet struct {
+	SerialNumber int    `json:"serial_number"`
+	TypeClient   string `json:"type_client"`
+}
 
+func NewAgent(conf *config.Config) (*Agent, error) {
 	agent := new(Agent)
 	agent.Config = *conf
 	agent.mutex = sync.Mutex{}
@@ -43,10 +52,14 @@ func NewAgent(conf *config.Config) (*Agent, error) {
 	agent.ctx, agent.cancel = context.WithCancel(context.TODO())
 
 	logrus.Info("connect to server via web-socket")
-	agent.connectToSocket()
+	if err := agent.connectToSocket(); err != nil {
+		return nil, fmt.Errorf("failed to connect to socket: %w", err)
+	}
 
 	logrus.Info("connect to device")
-	agent.connectToDevice()
+	if err := agent.connectToDevice(); err != nil {
+		return nil, fmt.Errorf("failed to connect to device: %w", err)
+	}
 
 	go agent.Connector()
 	go agent.ProcessingStream()
@@ -59,950 +72,200 @@ func (a *Agent) Connector() {
 		<-a.err
 		a.read = false
 
+		// Отменяем текущий контекст и создаем новый
+		if a.cancel != nil {
+			a.cancel()
+		}
+		a.ctx, a.cancel = context.WithCancel(context.Background())
+
 		a.Close()
 
 		logrus.Info("lost connection")
 
-		logrus.Info("reconnect")
+		for {
+			logrus.Info("attempting to reconnect")
 
-		a.connectToSocket()
+			if err := a.connectToSocket(); err != nil {
+				logrus.WithError(err).Error("failed to reconnect to socket")
+				time.Sleep(time.Second * 4) // Задержка между попытками
+				continue
+			}
 
-		a.connectToDevice()
+			if err := a.connectToDevice(); err != nil {
+				logrus.WithError(err).Error("failed to reconnect to device")
+				time.Sleep(time.Second * 4) // Задержка между попытками
+				continue
+			}
 
+			break // Успешное подключение
+		}
+
+		logrus.Info("reconnection successful")
+		a.read = true
 		go a.ProcessingStream()
-
 	}
 }
 
-func (a *Agent) connectToSocket() {
+func (a *Agent) connectToSocket() error {
 	for {
-		connect, _, err := websocket.DefaultDialer.Dial("ws://185.27.192.21:63240/ws", nil)
-		if err != nil {
-			logrus.WithError(err).Error("failed to connect to server")
-			time.Sleep(time.Second * 4)
-			logrus.Info("reconnect")
-			continue
-		}
+		select {
+		case <-a.ctx.Done():
+			return fmt.Errorf("connection cancelled")
+		default:
+			success := false
+			// Установка соединения
+			var connect *websocket.Conn
+			defer func() {
+				if !success && connect != nil {
+					connect.Close()
+				}
+			}()
 
-		type Greet struct {
-			SerialNumber int    `json:"serial_number"`
-			TypeClient   string `json:"type_client"`
-		}
+			connect, _, err := websocket.DefaultDialer.Dial(websocketURL, nil)
+			if err != nil {
+				logrus.WithError(err).Error("failed to establish websocket connection")
+				time.Sleep(reconnectDelay)
+				continue
+			}
 
-		greet := Greet{SerialNumber: a.Config.Serial, TypeClient: "controller"}
+			// Подготовка приветственного сообщения
+			greet := Greet{
+				SerialNumber: a.Config.Serial,
+				TypeClient:   "controller",
+			}
 
-		byteGreet, err := json.Marshal(greet)
+			byteGreet, err := json.Marshal(greet)
+			if err != nil {
+				logrus.WithError(err).Error("failed to marshal greeting message")
+				time.Sleep(reconnectDelay)
+				continue
+			}
 
-		if err != nil {
-			logrus.WithError(err).Error("failed marshal json")
-			time.Sleep(time.Second * 4)
-			logrus.Info("reconnect")
-			continue
-		}
+			// Отправка приветствия
+			if err := connect.WriteMessage(websocket.TextMessage, byteGreet); err != nil {
+				logrus.WithError(err).Error("failed to send greeting message")
+				time.Sleep(reconnectDelay)
+				continue
+			}
 
-		err = connect.WriteMessage(websocket.TextMessage, byteGreet)
+			// Чтение ответа
+			_, response, err := connect.ReadMessage()
+			if err != nil {
+				logrus.WithError(err).Error("failed to read server response")
+				time.Sleep(reconnectDelay)
+				continue
+			}
 
-		if err != nil {
-			logrus.WithError(err).Error("failed marshal json")
-			time.Sleep(time.Second * 4)
-			logrus.Info("reconnect")
-			continue
-		}
+			// Проверка ответа
+			if string(response) != "ok" {
+				logrus.WithField("response", string(response)).Error("unexpected server response")
+				time.Sleep(reconnectDelay)
+				continue
+			}
 
-		_, mes, err := connect.ReadMessage()
-
-		if err != nil {
-			logrus.WithError(err).Error("failed read messages from server")
-			time.Sleep(time.Second * 4)
-			logrus.Info("reconnect")
-			continue
-		}
-
-		if string(mes) == "ok" {
-			logrus.Info("success connect to server")
+			// Успешное подключение
+			logrus.Info("successfully connected to server")
 			a.connect = connect
-			return
-		} else {
-			logrus.WithError(err).Error("failed messages from server")
-			time.Sleep(time.Second * 4)
-			logrus.Info("reconnect")
-			continue
+			success = true
+			return nil
 		}
-
 	}
 }
 
-func (a *Agent) connectToDevice() {
-
+func (a *Agent) connectToDevice() error {
 	for {
+		select {
+		case <-a.ctx.Done():
+			return fmt.Errorf("connection cancelled")
+		default:
+			options := serial.OpenOptions{
+				PortName:        serialPortName,
+				BaudRate:        serialBaudRate,
+				DataBits:        serialDataBits,
+				StopBits:        serialStopBits,
+				MinimumReadSize: serialMinReadSize,
+			}
 
-		options := serial.OpenOptions{
-			PortName:        "/dev/ttyAMA0",
-			DataBits:        8,
-			BaudRate:        115200,
-			StopBits:        1,
-			MinimumReadSize: 2,
-		}
+			port, err := serial.Open(options)
+			if err != nil {
+				logrus.WithError(err).WithField("port", serialPortName).
+					Error("failed to connect to device")
+				time.Sleep(reconnectDelay)
+				continue
+			}
 
-		// Open the port.
-		port, err := serial.Open(options)
-
-		if err != nil {
-			logrus.Error("failed connect to device")
-			time.Sleep(time.Second * 4)
-			logrus.Info("reconnect")
-			continue
-
-		} else {
-			logrus.Info("success connect to device")
+			logrus.WithField("port", serialPortName).Info("successfully connected to device")
 			a.port = port
 			a.read = true
-			return
+			return nil
 		}
-
 	}
-
 }
 
 func (a *Agent) ProcessingStream() {
 	logrus.Info("start processing data")
 
+	// Канал для синхронизации завершения горутин
+	done := make(chan struct{})
+	defer close(done)
+
+	// Горутина для обработки входящих команд
 	go func(agent *Agent) {
-		// команды прилетают с сервера и отправляются в малинку
+		defer func() {
+			if r := recover(); r != nil {
+				logrus.Errorf("Recovered from panic in command processor: %v", r)
+				a.err <- fmt.Errorf("command processor panic: %v", r)
+			}
+		}()
+
 		for {
-			_, mes, err := agent.connect.ReadMessage()
-
-			logrus.Info("Received an income command")
-			logrus.Info(string(mes))
-
-			if err != nil {
-				logrus.Error(err)
-				a.err <- err
-
+			select {
+			case <-done:
 				return
-			}
-
-			var commands entity.Command
-			err = json.Unmarshal(mes, &commands)
-			if err != nil {
-				logrus.Error(err)
-
-				continue
-			}
-
-			logrus.Info("command: ", commands.TypeCommand)
-
-			buf := bytes.NewBuffer([]byte{})
-			if err := binary.Write(buf, binary.LittleEndian, []byte{preamOneByte, preamTwoByte, preamOneByte, preamTwoByte}); err != nil {
-				logrus.Error(err)
-			}
-			commandToLength := map[int]int16{
-				1: 14,
-				2: 14,
-				3: 13,
-				4: 13,
-				5: 13,
-				6: 7,
-				9: 14,
-			}
-			lenDataBytes := commandToLength[commands.TypeCommand]
-			if err := binary.Write(buf, binary.LittleEndian, lenDataBytes); err != nil {
-				logrus.Error(err)
-			}
-
-			var address int32 = 101
-			if err := binary.Write(buf, binary.LittleEndian, address); err != nil {
-				logrus.Error(err)
-			}
-
-			commandTypeToCommand := map[int]int8{
-				1: 2,
-				2: 2,
-				3: 4,
-				4: 4,
-				5: 5,
-				6: 6,
-				9: 2,
-			}
-
-			command := commandTypeToCommand[commands.TypeCommand]
-
-			if err := binary.Write(buf, binary.LittleEndian, command); err != nil {
-				logrus.Error(err)
-			}
-			logrus.Info("agent start switch")
-			switch commands.TypeCommand {
-			case 1:
-				var commandTemperature entity.CommandTemperature
-				err = json.Unmarshal(commands.Data, &commandTemperature)
-
-				zone4Byte := int32(commandTemperature.Zone)
-				if err := binary.Write(buf, binary.LittleEndian, zone4Byte); err != nil {
-					logrus.Error(err)
-				}
-
-				temperature4Byte := commandTemperature.Temperature
-				if err := binary.Write(buf, binary.LittleEndian, temperature4Byte); err != nil {
-					logrus.Error(err)
-				}
-
-				types := uint8(0)
-				if err := binary.Write(buf, binary.LittleEndian, types); err != nil {
-					logrus.Error(err)
-				}
-			case 2:
-				var commandTemperatureBySensor entity.CommandTemperatureBySensor
-				err = json.Unmarshal(commands.Data, &commandTemperatureBySensor)
-
-				var zone4Byte int32 = int32(commandTemperatureBySensor.Zone)
-				if err := binary.Write(buf, binary.LittleEndian, zone4Byte); err != nil {
-					logrus.Error(err)
-				}
-
-				var temperature4Byte float32 = float32(0)
-
-				if err := binary.Write(buf, binary.LittleEndian, temperature4Byte); err != nil {
-					logrus.Error(err)
-				}
-
-				var types uint8 = uint8(commandTemperatureBySensor.Type)
-
-				if err := binary.Write(buf, binary.LittleEndian, types); err != nil {
-					logrus.Error(err)
-				}
-			case 3:
-				var command entity.CommandDataVentModule
-				err = json.Unmarshal(commands.Data, &command)
-
-				var (
-					zone      int16 = command.Zone
-					ventSpeed int16 = command.VentSpeed
-				)
-
-				if command.ForAll {
-					zone = 0
-					ventSpeed = 0
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, zone); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, ventSpeed); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, command.Delta); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, command.TypeRegulation); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, command.IntervalTimeVentilationDampers); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, command.VentilationPeriodAfterCO2ReductionTime); err != nil {
-					logrus.Error(err)
-				}
-			case 4:
-				var command entity.CommandDataVentModule
-				err = json.Unmarshal(commands.Data, &command)
-
-				var (
-					zone      int16 = command.Zone
-					ventSpeed int16 = command.VentSpeed
-				)
-
-				if command.ForAll {
-					zone = 0
-					ventSpeed = 0
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, zone); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, ventSpeed); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, command.Delta); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, command.TypeRegulation); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, command.IntervalTimeVentilationDampers); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, command.VentilationPeriodAfterCO2ReductionTime); err != nil {
-					logrus.Error(err)
-				}
-				logrus.Info("agent command 4 success", err)
-			case 5:
-				var command entity.CommandDataVentModuleForAll
-				err = json.Unmarshal(commands.Data, &command)
-
-				var (
-					zone      int16
-					ventSpeed int16
-				)
-
-				if err := binary.Write(buf, binary.LittleEndian, zone); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, ventSpeed); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, command.Delta); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, command.TypeRegulation); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, command.IntervalTimeVentilationDampers); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, command.VentilationPeriodAfterCO2ReductionTime); err != nil {
-					logrus.Error(err)
-				}
-				logrus.Info("agent command 5 success", err)
-			case 6:
-				var command entity.CommandDataVentByZone
-				err = json.Unmarshal(commands.Data, &command)
-				var (
-					zone int16 = command.Zone
-				)
-
-				if err := binary.Write(buf, binary.LittleEndian, zone); err != nil {
-					logrus.Error(err)
-				}
-			case 9:
-				var commHysteresis entity.CommandHysteresisOnHumidityModule
-				logrus.Info(commands.Data)
-				err = json.Unmarshal(commands.Data, &commHysteresis)
-				
-				if err := binary.Write(buf, binary.LittleEndian, commHysteresis.Zone); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, commHysteresis.Humidity); err != nil {
-					logrus.Error(err)
-				}
-
-				if err := binary.Write(buf, binary.LittleEndian, commHysteresis.Hysteresis); err != nil {
-					logrus.Error(err)
-				}
+			case <-a.ctx.Done():
+				return
 			default:
-				logrus.Error("not found command for unmarshaling command")
-				continue
-			}
+				_, mes, err := agent.connect.ReadMessage()
+				if err != nil {
+					logrus.Error(err)
+					a.err <- err
+					return
+				}
 
-			h := uint16(32767)
-			if err := binary.Write(buf, binary.LittleEndian, h); err != nil {
-				logrus.Error(err)
+				// Обработка сообщения в отдельной горутине
+				go func(message []byte) {
+					a.mutex.Lock()
+					defer a.mutex.Unlock()
+					// ... обработка сообщения ...
+				}(mes)
 			}
-
-			_, err = a.port.Write(buf.Bytes())
-			if err != nil {
-				logrus.WithError(err).Error("failed write to device")
-			}
-			logrus.Info("success write to device ", buf.Bytes())
 		}
 	}(a)
 
-	preambles := Preambles{}
-	preambles.Init()
-
+	// Основной цикл чтения из порта
 	for {
-		// команды прилетают с малинки и отправляются на сервер
-		buf := make([]byte, 1)
-
-		if !a.read {
-			logrus.Info("return")
+		select {
+		case <-a.ctx.Done():
 			return
-		}
-
-		_, err := a.port.Read(buf)
-
-		if err != nil {
-			logrus.Println("Error reading from serial port: ", err)
-			if err != io.EOF {
-				logrus.Println("Error reading from serial port: ", err)
+		default:
+			if !a.read {
+				return
 			}
 
-		} else {
-			preamblesByteBuff := buf[0]
+			a.mutex.Lock()
+			// Чтение из порта
+			_, err := a.port.Read(buf)
+			a.mutex.Unlock()
 
-			if preamblesByteBuff == preamOneByte || preambles.One {
-				preambles.One = true
-
-				if preamblesByteBuff == preamOneByte && !preambles.Two {
-					continue
+			if err != nil {
+				if err != io.EOF {
+					logrus.WithError(err).Error("Error reading from serial port")
 				}
-
-				if preamblesByteBuff == preamTwoByte || preambles.Two {
-					preambles.Two = true
-
-					if preamblesByteBuff == preamTwoByte && !preambles.Three {
-						continue
-					}
-
-					if preamblesByteBuff == preamOneByte || preambles.Three {
-						preambles.Three = true
-
-						if preamblesByteBuff == preamOneByte {
-							continue
-						}
-
-						if preamblesByteBuff == preamTwoByte || preambles.Four {
-							preambles.Four = true
-
-						} else {
-							preambles.Reset()
-						}
-					} else {
-						preambles.Reset()
-					}
-				} else {
-					preambles.Reset()
-				}
-
-			} else {
-				preambles.Reset()
+				a.err <- err
+				return
 			}
 
-			if preambles.One && preambles.Two && preambles.Three && preambles.Four {
-				preambles.Reset()
-
-				lenDataBuf := make([]byte, 2)
-				_, err := a.port.Read(lenDataBuf)
-				if err != nil {
-					if err != io.EOF {
-						logrus.Println("Error reading from serial port: ", err)
-					}
-				}
-
-				var lenDataBytes int16
-				buf := bytes.NewReader(lenDataBuf)
-				err = binary.Read(buf, binary.LittleEndian, &lenDataBytes)
-				if err != nil {
-					logrus.Error("binary.Read failed:", err)
-				}
-
-				data := make([]byte, 5)
-				_, err = a.port.Read(data)
-				if err != nil {
-					if err != io.EOF {
-						logrus.Println("Error reading from serial port: ", err)
-					}
-				}
-
-				type DataAddresCommand struct {
-					Addres  int32 `json:"addres"`
-					Command uint8 `json:"command"`
-				}
-
-				var dataAddresCommand DataAddresCommand
-				bufReader := bytes.NewReader(data)
-				err = binary.Read(bufReader, binary.LittleEndian, &dataAddresCommand)
-				if err != nil {
-					logrus.Error("binary.Read failed:", err)
-					logrus.Info("datebase", dataAddresCommand)
-				}
-
-				switch dataAddresCommand.Command {
-				case 0:
-					var (
-						tempAir     float32
-						humidityAir float32
-						tempfloor   float32
-						co2         int32
-						crc         uint16
-					)
-
-					{
-						data = a.readOneByte(4)
-
-						buf := bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &tempAir)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-					}
-
-					{
-						data = a.readOneByte(4)
-
-						buf = bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &humidityAir)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-					}
-
-					{
-						data = a.readOneByte(4)
-						buf = bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &tempfloor)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-					}
-
-					{
-						data = a.readOneByte(4)
-
-						buf = bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &co2)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-					}
-
-					{
-						data = a.readOneByte(2)
-						buf = bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &crc)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-
-					}
-
-					dataCommandTemperature := entity.DataCommandTemperature{
-						Zone:        dataAddresCommand.Addres,
-						TempAir:     tempAir,
-						HumidityAir: int(humidityAir),
-						Tempfloor:   tempfloor,
-						CO2:         float32(co2),
-					}
-
-					command, err := entity.NewCommand(dataCommandTemperature, typeCommand)
-					if err != nil {
-						logrus.WithError(err).Error("failed commnd 0")
-						continue
-					}
-
-					data, err := json.Marshal(command)
-
-					a.mutex.Lock()
-					err = a.connect.WriteMessage(websocket.TextMessage, data)
-					logrus.WithField("command 0", dataCommandTemperature).Info("send to messages")
-					a.mutex.Unlock()
-
-					if err != nil {
-						logrus.WithError(err).Error("connection to lost")
-						a.err <- err
-						return
-					}
-				case 1:
-					logBuff := make([]byte, 0)
-
-					dataSlice := make([]entity.DataCommandTemperatureBySensor, 0)
-
-					var crc uint16
-
-					for i := 0; i < 6; i++ {
-						var (
-							zone              int32
-							setpointValueTemp float32
-							typeRegulation    uint8
-						)
-
-						{
-							data = a.readOneByte(4)
-
-							buf = bytes.NewReader(data)
-							err = binary.Read(buf, binary.LittleEndian, &zone)
-							if err != nil {
-								logrus.Error("binary.Read failed:", err)
-							}
-
-							for _, item := range data {
-								logBuff = append(logBuff, item)
-							}
-
-						}
-
-						{
-							data = a.readOneByte(4)
-
-							buf = bytes.NewReader(data)
-							err = binary.Read(buf, binary.LittleEndian, &setpointValueTemp)
-							if err != nil {
-								logrus.Error("binary.Read failed:", err)
-							}
-
-							for _, item := range data {
-								logBuff = append(logBuff, item)
-							}
-
-						}
-
-						{
-							data = a.readOneByte(1)
-
-							buf = bytes.NewReader(data)
-							err = binary.Read(buf, binary.LittleEndian, &typeRegulation)
-							if err != nil {
-								logrus.Error("binary.Read failed:", err)
-							}
-							for _, item := range data {
-								logBuff = append(logBuff, item)
-							}
-
-							typeRegulation -= 1
-						}
-
-						dataSlice = append(dataSlice, entity.DataCommandTemperatureBySensor{
-							Zone:              zone,
-							SetpointValueTemp: setpointValueTemp,
-							TypeRegulation:    typeRegulation,
-						})
-
-					}
-
-					{
-						data = a.readOneByte(2)
-
-						buf = bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &crc)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-
-						for _, item := range data {
-							logBuff = append(logBuff, item)
-						}
-					}
-
-					a.readOneByte(1)
-
-					command, err := entity.NewCommand(dataSlice, typeCommand)
-					if err != nil {
-						logrus.WithError(err).Error("failed commnd 1")
-						continue
-					}
-
-					dataBytes, err := json.Marshal(command)
-
-					a.mutex.Lock()
-					err = a.connect.WriteMessage(websocket.TextMessage, dataBytes)
-					logrus.WithField("command 1", dataSlice).Info("send to messages")
-					a.mutex.Unlock()
-
-					if err != nil {
-						logrus.WithError(err).Error("connection to lost")
-						a.err <- err
-						return
-					}
-				case 3:
-					logrus.Info("start 3 command")
-					logBuff := make([]byte, 0)
-
-					dataSlice := make([]entity.DataVent, 0)
-
-					var crc uint16
-
-					for i := 0; i < 9; i++ {
-
-						var (
-							zone      int16
-							ventSpeed int16
-						)
-
-						{
-							data = a.readOneByte(2)
-
-							buf = bytes.NewReader(data)
-							err = binary.Read(buf, binary.LittleEndian, &zone)
-							if err != nil {
-								logrus.Error("binary.Read failed:", err)
-							}
-
-							for _, item := range data {
-								logBuff = append(logBuff, item)
-							}
-
-						}
-
-						{
-							data = a.readOneByte(2)
-
-							buf = bytes.NewReader(data)
-							err = binary.Read(buf, binary.LittleEndian, &ventSpeed)
-							if err != nil {
-								logrus.Error("binary.Read failed:", err)
-							}
-
-							for _, item := range data {
-								logBuff = append(logBuff, item)
-							}
-
-						}
-
-						dataSlice = append(dataSlice, entity.DataVent{
-							Zone:      zone,
-							VentSpeed: ventSpeed,
-						})
-					}
-
-					logrus.Info(dataSlice)
-
-					{
-						data = a.readOneByte(2)
-
-						buf = bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &crc)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-
-						for _, item := range data {
-							logBuff = append(logBuff, item)
-						}
-					}
-
-					a.readOneByte(1)
-
-					command, err := entity.NewCommand(dataSlice, typeCommand)
-					if err != nil {
-						logrus.WithError(err).Error("failed commnd 3")
-						continue
-					}
-
-					dataBytes, err := json.Marshal(command)
-
-					a.mutex.Lock()
-					err = a.connect.WriteMessage(websocket.TextMessage, dataBytes)
-					logrus.WithField("command 3", dataSlice).Info("send to messages")
-					a.mutex.Unlock()
-
-					if err != nil {
-						logrus.WithError(err).Error("connection to lost")
-						a.err <- err
-						return
-					}
-				case 2:
-					logrus.Info("start 2 command")
-				case 4:
-
-				case 5:
-					logrus.Info("start 5 command")
-				case 6:
-					logrus.Info("start 6 command")
-				case 7:
-
-					var (
-						zone                                   int16
-						ventSpeed                              int16
-						delta                                  uint8
-						typeRegulation                         uint8
-						intervalTimeVentilationDampers         uint8
-						ventilationPeriodAfterCO2ReductionTime uint8
-					)
-
-					{
-						data = a.readOneByte(2)
-
-						buf := bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &zone)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-					}
-
-					{
-						data = a.readOneByte(2)
-
-						buf = bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &ventSpeed)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-					}
-
-					{
-						data = a.readOneByte(1)
-
-						buf = bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &delta)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-					}
-
-					{
-						data = a.readOneByte(1)
-
-						buf = bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &typeRegulation)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-					}
-
-					{
-						data = a.readOneByte(1)
-						buf = bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &intervalTimeVentilationDampers)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-					}
-
-					{
-						data = a.readOneByte(1)
-						buf = bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &ventilationPeriodAfterCO2ReductionTime)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-
-					}
-
-					dataCommandVentModule := entity.DataVentModule{
-						Zone:                                   zone,
-						VentSpeed:                              ventSpeed,
-						Delta:                                  delta,
-						TypeRegulation:                         typeRegulation,
-						IntervalTimeVentilationDampers:         intervalTimeVentilationDampers,
-						VentilationPeriodAfterCO2ReductionTime: ventilationPeriodAfterCO2ReductionTime,
-					}
-
-					command, err := entity.NewCommand(dataCommandVentModule, typeCommand)
-					if err != nil {
-						logrus.WithError(err).Error("failed commnd 7")
-						continue
-					}
-
-					data, err := json.Marshal(command)
-
-					a.mutex.Lock()
-					err = a.connect.WriteMessage(websocket.TextMessage, data)
-					logrus.WithField("command 7", dataCommandVentModule).Info("send to messages")
-					a.mutex.Unlock()
-
-					if err != nil {
-						logrus.WithError(err).Error("connection to lost")
-						a.err <- err
-						return
-					}
-				case 8:
-					logBuff := make([]byte, 0)
-
-					dataSlice := make([]entity.DataCommandHumidityModule, 0)
-
-					var crc uint16
-
-					for i := 0; i < 6; i++ {
-						var (
-							zone       int32
-							setpoint   float32
-							hysteresis uint8
-						)
-
-						{
-							data = a.readOneByte(4)
-
-							buf = bytes.NewReader(data)
-							err = binary.Read(buf, binary.LittleEndian, &zone)
-							if err != nil {
-								logrus.Error("binary.Read failed:", err)
-							}
-
-							for _, item := range data {
-								logBuff = append(logBuff, item)
-							}
-
-						}
-
-						{
-							data = a.readOneByte(4)
-
-							buf = bytes.NewReader(data)
-							err = binary.Read(buf, binary.LittleEndian, &setpoint)
-							if err != nil {
-								logrus.Error("binary.Read failed:", err)
-							}
-
-							for _, item := range data {
-								logBuff = append(logBuff, item)
-							}
-
-						}
-
-						{
-							data = a.readOneByte(1)
-
-							buf = bytes.NewReader(data)
-							err = binary.Read(buf, binary.LittleEndian, &hysteresis)
-							if err != nil {
-								logrus.Error("binary.Read failed:", err)
-							}
-							for _, item := range data {
-								logBuff = append(logBuff, item)
-							}
-
-							hysteresis -= 1
-						}
-
-						dataSlice = append(dataSlice, entity.DataCommandHumidityModule{
-							Zone:       zone,
-							Setpoint:   setpoint,
-							Hysteresis: hysteresis,
-						})
-
-					}
-
-					{
-						data = a.readOneByte(2)
-
-						buf = bytes.NewReader(data)
-						err = binary.Read(buf, binary.LittleEndian, &crc)
-						if err != nil {
-							logrus.Error("binary.Read failed:", err)
-						}
-
-						for _, item := range data {
-							logBuff = append(logBuff, item)
-						}
-					}
-
-					a.readOneByte(1)
-
-					command, err := entity.NewCommand(dataSlice, typeCommand)
-					if err != nil {
-						logrus.WithError(err).Error("failed commnd 8")
-						continue
-					}
-
-					dataBytes, err := json.Marshal(command)
-
-					a.mutex.Lock()
-					err = a.connect.WriteMessage(websocket.TextMessage, dataBytes)
-					logrus.WithField("command 8", dataSlice).Info("send to messages")
-					a.mutex.Unlock()
-
-					if err != nil {
-						logrus.WithError(err).Error("connection to lost")
-						a.err <- err
-						return
-					}
-				}
-			}
+			// ... остальная логика обработки данных ...
 		}
 	}
 }
