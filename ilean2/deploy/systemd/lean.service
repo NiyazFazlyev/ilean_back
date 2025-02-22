@@ -1,0 +1,12 @@
+[Unit]
+Description=ilean
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lean
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
